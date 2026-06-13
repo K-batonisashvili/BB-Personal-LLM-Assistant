@@ -25,7 +25,7 @@ VLM_MODEL       = secrets["ai_models"]["VLM_MODEL"]
 TTS_VOICE       = secrets["ai_models"]["TTS_VOICE"]
 
 # hardcoded these 
-WHISPER_DEVICE  = "cpu"
+WHISPER_DEVICE  = "cuda"
 WAKE_WORD       = ["Hey BB", "Hey BeeBee", "Hey BB"]
 STOP_WORDS      = ["BB stop", "go to sleep", "stop listening"]
 KOKORO_MODEL    = "kokoro-v1.0.onnx"
@@ -148,9 +148,12 @@ def activate_BB_brain(query: str):
 
     log.info(f"🧠 Processing: '{query}'")
     push_overlay({"type": "status", "text": "THINKING..."})
-    
+
     try:
-        b64_img = None
+        frame_wait_deadline = time.time() + 2.0
+        while latest_frame is None and time.time() < frame_wait_deadline:
+            time.sleep(0.1)
+        img_bytes = None
         with frame_lock:
             if latest_frame is not None:
                 h, w = latest_frame.shape[:2]
@@ -159,15 +162,19 @@ def activate_BB_brain(query: str):
                     scale = max_dim / max(h, w)
                     ai_frame = cv2.resize(latest_frame, (int(w * scale), int(h * scale)))
                 else:
-                    ai_frame = latest_frame
-                    
+                    ai_frame = latest_frame.copy()
                 _, buf = cv2.imencode('.jpg', ai_frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-                
-                b64_img = base64.b64encode(buf.tobytes()).decode('utf-8')
+                img_bytes = buf.tobytes()   # raw bytes — correct format for ollama.chat
 
-        images_list = [b64_img] if b64_img else []
-        prompt = f"You are BB, an advanced AI interface. Respond to the query: '{query}'"
-
+        images_list = [img_bytes] if img_bytes else []
+        has_image = bool(img_bytes)
+        log.info(f"📸 Vision: {'frame attached ({} bytes)'.format(len(img_bytes)) if has_image else 'no frame — text only'}")
+        prompt = (
+            f"You are BB, a concise voice AI assistant. "
+            f"Make a definitive guess immediately. Do not debate internally or second-guess yourself. "
+            f"Answer in 1-3 spoken sentences only. No bullet points or analysis. "
+            f"Query: '{query}'"
+        )
         resp = ollama.chat(
             model=VLM_MODEL,
             messages=[
@@ -178,33 +185,76 @@ def activate_BB_brain(query: str):
                 }
             ],
             options={
-                "num_predict": 200,  
-                "temperature": 0.7,   # Qwen doc recs
-            } 
+                "num_predict": 2000,
+                "temperature": 1.0,
+                "top_p": 0.8,
+                "top_k": 20,
+                "min_p": 0.0,
+                "presence_penalty": 1.5,
+                "repeat_penalty": 1.15,
+            }
         )
         
         text = resp.message.content.strip()
-        log.info(f"RAW MODEL OUTPUT: {repr(text)}")
-        # ──────────────────────────────────────────────
-        
-        # Scrub out the internal monologue
+        used_thinking_field = False
+        if not text and hasattr(resp.message, 'thinking') and resp.message.thinking:
+            used_thinking_field = True
+            text = resp.message.thinking.strip()
+        log.info(f"RAW MODEL OUTPUT: {repr(text[:120])}")
+ 
+        # Scrub XML thinking/tool tags if present
+        text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
         text = re.sub(r'<tool_call>.*?</tool_call>', '', text, flags=re.DOTALL).strip()
-        # fallback safety catch
+ 
+        if used_thinking_field and text:
+            log.info("Distilling thinking chain into spoken answer...")
+            try:
+                distil = ollama.chat(
+                    model=VLM_MODEL,
+                    messages=[
+                        {
+                            'role': 'user',
+                            'content': (
+                                "You are BB, a concise voice AI. "
+                                "Here is your internal reasoning about a visual query:\n\n"
+                                + text +
+                                "\n\nNow give ONLY the final spoken answer in 1-3 sentences. "
+                                "No bullet points, no analysis, no self-correction. Just the answer. /no_think"
+                            )
+                        }
+                    ],
+                    options={
+                        "num_predict": 2000,
+                        "temperature": 1.0,
+                        "top_p": 0.8,
+                        "top_k": 20,
+                        "min_p": 0.0,
+                        "presence_penalty": 1.5,
+                        "repeat_penalty": 1.15,
+                    }
+                )
+                spoken = distil.message.content.strip()
+                if spoken:
+                    text = spoken
+                    log.info(f"Distilled: {repr(text[:120])}")
+            except Exception as de:
+                log.warning(f"Distil step failed: {de}")
+ 
+        # Final fallback
         if not text:
             text = "I'm having trouble processing that right now."
-            
+ 
         log.info(f"🤖 BB: {text}")
         push_overlay({"type": "response", "text": text})
 
         if kokoro_tts:
             samples, sr = kokoro_tts.create(text, voice=TTS_VOICE, speed=1.0, lang="en-us")
             wav_bytes = pcm_to_wav_bytes(samples, sr)
-            b64_audio = base64.b64encode(wav_bytes).decode('utf-8')
-            
+            b64_audio = base64.b64encode(wav_bytes).decode('utf-8')          
             audio_duration_seconds = len(samples) / sr
             with state_lock:
                 BB_speaking = True
-                
+
             push_overlay({"type": "tts_audio", "data": b64_audio})
             threading.Thread(target=auto_unmute_mic, args=(audio_duration_seconds + 0.5,), daemon=True).start()
 
@@ -216,6 +266,7 @@ def activate_BB_brain(query: str):
             BB_awake = False
         log.info("💤 Returned to standby.")
 
+# process streaming audio and handle vad/wake words
 # process streaming audio and handle vad/wake words
 def audio_processor_loop():
     global client_sample_rate, BB_awake
@@ -257,7 +308,7 @@ def audio_processor_loop():
                     active_phrase_chunks.append(eval_window)
                     silence_ms += 400
                     
-                    if silence_ms >= 800: 
+                    if silence_ms >= 400: 
                         full_phrase = np.concatenate(active_phrase_chunks)
                         f_segments, _ = whisper.transcribe(io.BytesIO(pcm_to_wav_bytes(full_phrase, 16000)), language="en", vad_filter=True)
                         final_text = " ".join(s.text for s in f_segments).strip()
@@ -277,9 +328,10 @@ def audio_processor_loop():
                                 
                                 cmd = lower_text.split(triggered_word)[-1].strip()
                                 clean_cmd = cmd.translate(str.maketrans('', '', string.punctuation)).strip()
+                                
                                 if clean_cmd: 
-                                    push_overlay({"type": "transcript", "text": cmd})
-                                    threading.Thread(target=activate_BB_brain, args=(cmd,), daemon=True).start()
+                                    push_overlay({"type": "transcript", "text": final_text})
+                                    threading.Thread(target=activate_BB_brain, args=(final_text,), daemon=True).start()
                                 else:
                                     log.info("Awake and waiting for command...")
                                     
@@ -294,7 +346,7 @@ def audio_processor_loop():
 
             segments, _ = whisper.transcribe(
                 io.BytesIO(pcm_to_wav_bytes(eval_window, 16000)),
-                language="en", vad_filter=True, vad_parameters={"min_silence_duration_ms": 250}
+                language="en", vad_filter=True, vad_parameters={"min_silence_duration_ms": 150}
             )
             
             if len(list(segments)) > 0:
