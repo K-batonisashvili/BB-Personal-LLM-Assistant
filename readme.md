@@ -7,7 +7,7 @@
       <p>Everything runs locally. No cloud APIs, no subscriptions, no data tracking, no cache or cookies, and no corporate data scraping. Everything can be run on your local machine.</p>
     </td>
     <td width="35%" valign="top" align="center">
-      <img src="imgs/BB_demo.gif" width="100%" style="border-radius: 8px; border: 1px solid #30363d;" alt="BB AI Assistant Demo" />
+      <img src="imgs/BB_updated_demo.gif" width="100%" style="border-radius: 8px; border: 1px solid #30363d;" alt="BB AI Assistant Demo" />
     </td>
   </tr>
 </table>
