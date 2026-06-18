@@ -11,6 +11,7 @@
     --green:   #00ff9d;
     --dim:     #00cc7a;
     --red:     #ff4444;
+    --blue:    #44aaff;
     --bg:      rgba(3, 10, 6, 0.6);
     --panel:   rgba(0, 255, 157, 0.15);
     --border:  rgba(0, 255, 157, 0.3);
@@ -49,7 +50,9 @@
   #bottom { padding: 12px 18px 20px; border-top: 1px solid var(--border); display: flex; gap: 10px; background: rgba(0,0,0,0.6); }
   .btn { flex: 1; padding: 12px 0; border: 1px solid var(--border); background: rgba(0,0,0,0.4); color: var(--dim); font-family: var(--font); font-size: 11px; border-radius: 6px; cursor: pointer; }
   #btn-listen.active { background: rgba(0,255,157,0.2); border-color: var(--green); color: var(--green); }
-  #btn-manual { border-color: var(--green); font-weight: bold; }
+  
+  #btn-voice { border-color: var(--green); font-weight: bold; }
+  #btn-photo { border-color: var(--blue); color: var(--blue); font-weight: bold; }
 </style>
 </head>
 <body>
@@ -73,14 +76,14 @@
 
   <div id="bottom">
     <button class="btn" id="btn-listen" onclick="toggleListen()">Initialize</button>
-    <button class="btn" id="btn-manual" onclick="manualWake()" style="display: none;">Manual Listen</button>
+    <button class="btn" id="btn-voice" onclick="manualWake('voice')" style="display: none;">Voice</button>
+    <button class="btn" id="btn-photo" onclick="manualWake('photo')" style="display: none;">Photo</button>
     <button class="btn" id="btn-interrupt" onclick="interruptBB()" style="display: none; border-color: var(--red); color: var(--red);">Stop BB</button>
     <button class="btn" id="btn-reset" onclick="resetPipeline()" style="display:none; color: var(--red); border-color: var(--red);">Refresh</button>
   </div>
 </div>
 
 <script>
-// global state variables
 const SERVER = window.location.origin;
 let mediaStream = null;
 let audioCtx    = null;
@@ -90,14 +93,58 @@ let analyser    = null;
 let levelTimer  = null;
 let frameTimer  = null;
 let isPhoneSpeaking = false;
-let currentAudio = null;
 
 let scriptNode  = null;
 const canvas = document.createElement('canvas');
 const ctx = canvas.getContext('2d');
 const videoEl = document.getElementById('camera-preview');
 
-// update debug monitor
+// --- Audio Streaming Queue Manager ---
+let audioPlaybackQueue = [];
+let isAudioPlaying = false;
+let currentAudioObj = null;
+let generationComplete = false;
+
+function playNextInQueue() {
+    if (audioPlaybackQueue.length === 0) {
+        if (generationComplete) {
+            // All done speaking
+            isAudioPlaying = false;
+            document.getElementById('btn-interrupt').style.display = 'none';
+            document.getElementById('btn-voice').style.display = 'block';
+            document.getElementById('btn-photo').style.display = 'block';
+            document.getElementById('btn-reset').style.display = 'block';
+            fetch(`${SERVER}/reset`, { method: 'POST' }).catch(()=>{}); // Tell server to unmute
+        } else {
+            isAudioPlaying = false; // Wait for more chunks
+        }
+        return;
+    }
+
+    isAudioPlaying = true;
+    document.getElementById('btn-interrupt').style.display = 'block';
+    document.getElementById('btn-voice').style.display = 'none';
+    document.getElementById('btn-photo').style.display = 'none';
+    document.getElementById('btn-reset').style.display = 'none';
+
+    const url = audioPlaybackQueue.shift();
+    currentAudioObj = new Audio(url);
+    currentAudioObj.onended = playNextInQueue;
+    currentAudioObj.play();
+}
+
+function clearAudioQueue() {
+    audioPlaybackQueue = [];
+    generationComplete = false;
+    if (currentAudioObj) {
+        currentAudioObj.pause();
+        currentAudioObj.currentTime = 0;
+        currentAudioObj = null;
+    }
+    isAudioPlaying = false;
+}
+// -------------------------------------
+
 function logPhone(msg, isError=false) {
   const el = document.getElementById('debug-monitor');
   el.style.borderColor = isError ? 'var(--red)' : 'var(--border)';
@@ -105,7 +152,6 @@ function logPhone(msg, isError=false) {
   el.innerHTML = `> ${msg}`;
 }
 
-// setup websocket connection
 function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   wsConn = new WebSocket(`${proto}://${location.host}/ws`);
@@ -123,7 +169,7 @@ function connectWS() {
     else if (msg.type === 'status') {
       document.getElementById('status-text').textContent = `BB · ${msg.text}`;
     }
-    else if (msg.type === 'response') {
+    else if (msg.type === 'response_update') {
       logPhone(`🤖 BB: ${msg.text}`);
     } 
     else if (msg.type === 'vision_preview') {
@@ -131,41 +177,41 @@ function connectWS() {
       previewEl.src = "data:image/jpeg;base64," + msg.data;
       previewEl.style.display = 'block';
     }
-    else if (msg.type === 'tts_audio') {
+    else if (msg.type === 'hide_vision') {
+      document.getElementById('vision-preview').style.display = 'none';
+    }
+    else if (msg.type === 'tts_chunk') {
+      generationComplete = false;
       const binaryStr = window.atob(msg.data);
       const len = binaryStr.length;
       const bytes = new Uint8Array(len);
-      for (let i = 0; i < len; i++) {
-          bytes[i] = binaryStr.charCodeAt(i);
-      }
+      for (let i = 0; i < len; i++) bytes[i] = binaryStr.charCodeAt(i);
       const blob = new Blob([bytes.buffer], {type: 'audio/wav'});
       const url = URL.createObjectURL(blob);
       
-      currentAudio = new Audio(url);
-      document.getElementById('btn-interrupt').style.display = 'block';
-      document.getElementById('btn-manual').style.display = 'none';
-      document.getElementById('btn-reset').style.display = 'none';
-      
-      currentAudio.onended = () => {
-         document.getElementById('btn-interrupt').style.display = 'none';
-         document.getElementById('btn-manual').style.display = 'block';
-         document.getElementById('btn-reset').style.display = 'block';
-      };
-      
-      currentAudio.play();
+      audioPlaybackQueue.push(url);
+      if (!isAudioPlaying) playNextInQueue();
+    }
+    else if (msg.type === 'tts_complete') {
+      generationComplete = true;
+      if (!isAudioPlaying) playNextInQueue(); // Trigger finish if queue was empty
+    }
+    else if (msg.type === 'interrupt_audio') {
+      clearAudioQueue();
+      document.getElementById('btn-interrupt').style.display = 'none';
+      document.getElementById('btn-voice').style.display = 'block';
+      document.getElementById('btn-photo').style.display = 'block';
+      document.getElementById('btn-reset').style.display = 'block';
     }
   };
 }
 
-// send sample rate to server
 function sendInitMeta() {
   if (wsConn && wsConn.readyState === WebSocket.OPEN) {
     wsConn.send(JSON.stringify({ type: 'init', sampleRate: audioCtx.sampleRate }));
-    logPhone(`Streaming context built at ${audioCtx.sampleRate}Hz`);
   }
 }
 
-// send video frames to server
 function startVisionLoop() {
   frameTimer = setInterval(() => {
     if (!listening || videoEl.readyState < 2) return;
@@ -177,7 +223,6 @@ function startVisionLoop() {
   }, 1000);
 }
 
-// visual mic volume meter
 function startLevelMeter(stream) {
   const src = audioCtx.createMediaStreamSource(stream);
   analyser  = audioCtx.createAnalyser();
@@ -192,13 +237,12 @@ function startLevelMeter(stream) {
   }, 80);
 }
 
-// stream raw audio bytes to server
 async function startBinaryStreaming(stream) {
   const source = audioCtx.createMediaStreamSource(stream);
   scriptNode = audioCtx.createScriptProcessor(2048, 1, 1);
 
   scriptNode.onaudioprocess = e => {
-    if (!listening || !wsConn || wsConn.readyState !== WebSocket.OPEN || isPhoneSpeaking) return;    
+    if (!listening || !wsConn || wsConn.readyState !== WebSocket.OPEN || isAudioPlaying) return;    
     const floatSamples = e.inputBuffer.getChannelData(0);
     const int16Samples = new Int16Array(floatSamples.length);
     
@@ -213,138 +257,110 @@ async function startBinaryStreaming(stream) {
   scriptNode.connect(audioCtx.destination);
 }
 
-// stop tts and reset
 function interruptBB() {
-  if (currentAudio) {
-    currentAudio.pause();
-    currentAudio.currentTime = 0;
-    currentAudio = null;
-  }
+  clearAudioQueue();
   document.getElementById('btn-interrupt').style.display = 'none';
-  document.getElementById('btn-manual').style.display = 'block';
+  document.getElementById('btn-voice').style.display = 'block';
+  document.getElementById('btn-photo').style.display = 'block';
   
   if (wsConn && wsConn.readyState === WebSocket.OPEN) {
     wsConn.send(JSON.stringify({ type: 'interrupt' }));
   }
 }
 
-// trigger wake word manually
-function manualWake() {
+function manualWake(type) {
+  clearAudioQueue();
   if (wsConn && wsConn.readyState === WebSocket.OPEN) {
-    wsConn.send(JSON.stringify({ type: 'manual_wake' }));
-    document.getElementById('vision-preview').style.display = 'none';
+    // sends 'manual_wake_voice' or 'manual_wake_photo'
+    wsConn.send(JSON.stringify({ type: `manual_wake_${type}` })); 
+    if (type === 'voice') {
+      document.getElementById('vision-preview').style.display = 'none';
+    }
   }
 }
 
-// get list of available cameras
 async function populateCameraDropdown() {
   try {
     const devices = await navigator.mediaDevices.enumerateDevices();
     const videoDevices = devices.filter(d => d.kind === 'videoinput');
     const select = document.getElementById('camera-select');
-    
     select.innerHTML = '';
-    
     videoDevices.forEach((device, index) => {
       const option = document.createElement('option');
       option.value = device.deviceId;
       option.text = device.label || `Lens ${index + 1}`;
       select.appendChild(option);
     });
-  } catch (err) {
-    logPhone(`Error listing cameras: ${err.message}`, true);
-  }
+  } catch (err) {}
 }
 
-// camera swap function
 async function switchCamera() {
   if (!listening) return;
-
   const select = document.getElementById('camera-select');
-  const selectedDeviceId = select.value;
-
   try {
     const newVideoStream = await navigator.mediaDevices.getUserMedia({
-      video: { 
-        deviceId: { exact: selectedDeviceId },
-        width: { ideal: 1280 }, 
-        height: { ideal: 720 } 
-      }
+      video: { deviceId: { exact: select.value }, width: { ideal: 1280 }, height: { ideal: 720 } }
     });
-    
     const oldVideoTrack = mediaStream.getVideoTracks()[0];
-    if (oldVideoTrack) {
-      oldVideoTrack.stop();
-      mediaStream.removeTrack(oldVideoTrack);
-    }
-    
-    const newVideoTrack = newVideoStream.getVideoTracks()[0];
-    mediaStream.addTrack(newVideoTrack);
+    if (oldVideoTrack) { oldVideoTrack.stop(); mediaStream.removeTrack(oldVideoTrack); }
+    mediaStream.addTrack(newVideoStream.getVideoTracks()[0]);
     videoEl.srcObject = mediaStream;
-    logPhone(`Switched camera successfully.`);
-    
-  } catch (err) {
-    logPhone(`Failed to switch lens: ${err.message}`, true);
-  }
+  } catch (err) {}
 }
 
 async function resetPipeline() {
+  clearAudioQueue();
   logPhone("Sending core reset signal to server...");
   try {
     await fetch(`${SERVER}/reset`, { method: 'POST' });
     document.getElementById('vision-preview').style.display = 'none';
     document.getElementById('vision-preview').src = "";
-    logPhone("Pipeline flushed. Awaiting wake word.");
-  } catch (err) {
-    logPhone(`Reset failure: ${err.message}`, true);
-  }
+    logPhone("Pipeline flushed.");
+  } catch (err) {}
 }
 
-// start camera, mic, and websockets
 async function toggleListen() {
   const btn = document.getElementById('btn-listen');
   if (listening) {
     listening = false; 
-    clearInterval(frameTimer); 
-    clearInterval(levelTimer);
+    clearInterval(frameTimer); clearInterval(levelTimer);
     if (scriptNode) { scriptNode.disconnect(); scriptNode = null; }
     if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
     videoEl.srcObject = null; btn.textContent = 'Initialize'; btn.classList.remove('active');
-    document.getElementById('btn-manual').style.display = 'none';
+    document.getElementById('btn-voice').style.display = 'none';
+    document.getElementById('btn-photo').style.display = 'none';
     document.getElementById('vision-preview').style.display = 'none';
     document.getElementById('btn-reset').style.display = 'none';
     return;
   }
-
   try {
-    logPhone("Requesting core hardware tokens...");
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     if (audioCtx.state === 'suspended') await audioCtx.resume();
-
     mediaStream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true },
       video: { facingMode: "environment" }
     });
-    
     videoEl.srcObject = mediaStream;
     listening = true; 
-    btn.textContent = 'Running'; 
-    btn.classList.add('active');
-    document.getElementById('btn-manual').style.display = 'block';
+    btn.textContent = 'Running'; btn.classList.add('active');
+    document.getElementById('btn-voice').style.display = 'block';
+    document.getElementById('btn-photo').style.display = 'block';
     document.getElementById('btn-reset').style.display = 'block';
-    
     await populateCameraDropdown();
-
+    const activeTrack = mediaStream.getVideoTracks()[0];
+    if (activeTrack) {
+        const settings = activeTrack.getSettings();
+        if (settings.deviceId) {
+            document.getElementById('camera-select').value = settings.deviceId;
+        }
+    }
     sendInitMeta();
     startLevelMeter(mediaStream);
     startBinaryStreaming(mediaStream);
     startVisionLoop();
-  } catch(e) {
-    logPhone(`Initialization aborted: ${e.message}`, true);
-  }
+  } catch(e) {}
 }
 
-// start on connection
 connectWS();
 </script>
 </body>
